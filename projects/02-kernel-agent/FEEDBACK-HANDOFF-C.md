@@ -11,6 +11,7 @@ reward, parts, feedback = grade_detailed(candidate_source, level)
 
 payload = feedback.to_dict()   # 写日志、做路由、统计错误类型
 prompt = feedback.to_prompt()  # 直接交给下一轮代码生成 Agent
+breakdown = feedback.reward_breakdown  # 每个评分项的得分、上限和 shape 通过数
 ```
 
 现有 `grade(source, level)` 仍返回 `(reward, parts, feedback_text)`，旧调用方无需修改。
@@ -21,7 +22,7 @@ Agent 运行日志中的每条记录现在同时包含：
 {
   "feedback": "给生成模型使用的可执行建议",
   "feedback_structured": {
-    "schema_version": "1.0",
+    "schema_version": "1.1",
     "category": "PARTITION_LIMIT",
     "family": "TILE_LAYOUT",
     "severity": "structural",
@@ -31,6 +32,19 @@ Agent 运行日志中的每条记录现在同时包含：
     "redesign_required": true,
     "retryable": true,
     "raw_error": "dma_copy dst partition dimension 256 exceeds maximum 128",
+    "reward": 0.5,
+    "reward_breakdown": {
+      "parses": {"passed": true, "earned": 0.1, "maximum": 0.1},
+      "rules": {"passed": true, "earned": 0.2, "maximum": 0.2},
+      "runs": {"passed": true, "earned": 0.2, "maximum": 0.2},
+      "correct": {
+        "passed": false,
+        "earned": 0.0,
+        "maximum": 0.5,
+        "passed_cases": 0,
+        "total_cases": 3
+      }
+    },
     "current": 256,
     "maximum": 128,
     "dimension": "partition",
@@ -52,6 +66,9 @@ Agent 运行日志中的每条记录现在同时包含：
 - `UNKNOWN_ERROR`：显示 `raw_error`，记录新样本；不要静默吞掉。
 
 `category` 是供程序判断的稳定标识；不要解析 `summary` 或 `suggestion` 的自然语言。
+
+`reward_breakdown` 中的 `earned` 相加始终等于顶层 `reward`。其中 `correct`
+支持按通过 shape 数量给部分分，因此同时提供 `passed_cases` 和 `total_cases`。
 
 ## 当前分类族
 

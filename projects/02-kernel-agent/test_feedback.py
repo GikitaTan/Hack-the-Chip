@@ -79,6 +79,22 @@ class FeedbackClassificationTests(unittest.TestCase):
         self.assertEqual((reward2, parts2), (reward, parts))
         self.assertIsInstance(feedback, Feedback)
         self.assertEqual(feedback.category, "EMPTY_CODE")
+        self.assertEqual(feedback.reward, 0.0)
+        self.assertEqual(feedback.reward_breakdown["parses"]["earned"], 0.0)
+        self.assertEqual(feedback.reward_breakdown["correct"]["passed_cases"], 0)
+
+    def test_reward_breakdown_reports_partial_correctness(self):
+        parts = dict(parses=True, rules=True, runs=True, correct=False)
+        breakdown = agent._reward_breakdown(
+            0.55, parts, "1 of 10 shapes passed. On M=256: mismatch", 1)
+        self.assertEqual(breakdown["parses"]["earned"], 0.1)
+        self.assertEqual(breakdown["rules"]["earned"], 0.2)
+        self.assertEqual(breakdown["runs"]["earned"], 0.2)
+        self.assertEqual(breakdown["correct"]["earned"], 0.05)
+        self.assertEqual(breakdown["correct"]["passed_cases"], 1)
+        self.assertEqual(breakdown["correct"]["total_cases"], 10)
+        self.assertAlmostEqual(
+            sum(item["earned"] for item in breakdown.values()), 0.55)
 
     def test_static_rule_reward_is_unchanged(self):
         source = "def wrong_name(x):\n    return x\n"
@@ -87,6 +103,8 @@ class FeedbackClassificationTests(unittest.TestCase):
         self.assertTrue(parts["parses"])
         self.assertFalse(parts["rules"])
         self.assertEqual(feedback.family, "RULE")
+        self.assertEqual(feedback.reward_breakdown["parses"]["earned"], 0.1)
+        self.assertEqual(feedback.reward_breakdown["rules"]["earned"], 0.0)
 
 
 if __name__ == "__main__":

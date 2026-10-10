@@ -5,12 +5,12 @@ that decision; changing a classification here must never change the reward or
 the pass/fail result produced by :mod:`agent` and :mod:`nkibench`.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import re
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,8 @@ class Feedback:
     redesign_required: bool
     retryable: bool = True
     raw_error: str = ""
+    reward: Optional[float] = None
+    reward_breakdown: Optional[dict] = None
     current: Optional[float] = None
     maximum: Optional[float] = None
     dimension: Optional[str] = None
@@ -45,6 +47,10 @@ class Feedback:
         evidence = f" Checker evidence: {self.raw_error}" if self.raw_error else ""
         action = f" Next action: {self.suggestion}" if self.suggestion else ""
         return f"[{self.category}] {self.summary}.{evidence}{action}".strip()
+
+    def with_reward(self, reward: float, reward_breakdown: dict) -> "Feedback":
+        """Attach scoring data without changing the diagnosis itself."""
+        return replace(self, reward=reward, reward_breakdown=reward_breakdown)
 
 
 def make_feedback(category: str, family: str, severity: str, stage: str,

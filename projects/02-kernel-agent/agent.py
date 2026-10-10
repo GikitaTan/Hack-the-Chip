@@ -270,6 +270,49 @@ def _stage_from_parts(parts, feedback_text):
     return "success"
 
 
+def _reward_breakdown(reward, parts, feedback_text, level):
+    """Explain exactly how the existing scalar reward was assembled.
+
+    This function is deliberately accounting-only: it derives contributions
+    from the reward and booleans already produced by ``_grade_text`` and never
+    participates in pass/fail decisions.
+    """
+    total_cases = len(nkibench.LEVELS[level]["shapes"])
+    shape_match = re.search(r"(\d+) of (\d+) shapes passed", feedback_text)
+    if parts["correct"]:
+        passed_cases = total_cases
+    elif shape_match:
+        passed_cases, total_cases = map(int, shape_match.groups())
+    else:
+        passed_cases = 0
+
+    earned = {
+        key: WEIGHTS[key] if parts[key] else 0.0
+        for key in ("parses", "rules", "runs")
+    }
+    # Correctness is the only partially awarded component.  Deriving it from
+    # the already-computed total guarantees this report cannot drift from the
+    # checker's real score if shape accounting changes later.
+    earned["correct"] = max(
+        0.0,
+        min(WEIGHTS["correct"], reward - sum(earned.values())),
+    )
+
+    breakdown = {
+        key: {
+            "passed": bool(parts[key]),
+            "earned": round(earned[key], 10),
+            "maximum": WEIGHTS[key],
+        }
+        for key in ("parses", "rules", "runs", "correct")
+    }
+    breakdown["correct"].update({
+        "passed_cases": passed_cases,
+        "total_cases": total_cases,
+    })
+    return breakdown
+
+
 def grade_detailed(source, level):
     """Return ``(reward, parts, Feedback)`` for machine consumers such as member C."""
     reward, parts, feedback_text = _grade_text(source, level)
@@ -277,6 +320,10 @@ def grade_detailed(source, level):
     case_match = re.search(r"shapes passed\. On ([^:]+):", feedback_text)
     feedback = classify_error(feedback_text, stage=stage, level=level,
                               case=case_match.group(1) if case_match else None)
+    feedback = feedback.with_reward(
+        reward,
+        _reward_breakdown(reward, parts, feedback_text, level),
+    )
     return reward, parts, feedback
 
 
@@ -446,6 +493,7 @@ def solve(a, level, log):
             log.write(json.dumps(dict(level=level, round=rnd, reward=reward, parts=parts,
                                       prompt_chars=len(prompt), reply_chars=len(reply),
                                       code=src, feedback=feedback,
+                                      reward_breakdown=diagnosis.reward_breakdown,
                                       feedback_structured=diagnosis.to_dict())) + "\n")
         log.flush()
         graded.sort(key=lambda g: g[0], reverse=True)
