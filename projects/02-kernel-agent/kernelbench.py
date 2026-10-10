@@ -239,20 +239,35 @@ def check_rules(src, n):
 
 # ---------------------------------------------------------------- verification
 
-def describe_mismatch(got, want, tol):
+def describe_mismatch(got, want, tol, level=None, input_shape=None):
     """The message your agent has to learn from. Vague here means slow there."""
     got = np.asarray(got, dtype=np.float64)
     want = np.asarray(want, dtype=np.float64)
     if got.shape != want.shape:
+        if level == 10:
+            return (f"WRONG SHAPE: returned {got.shape}, reference is {want.shape}. "
+                    "For valid 1D convolution, use effective_kernel = "
+                    "dilation * (K - 1) + 1, then "
+                    "L_out = (L - effective_kernel) // stride + 1.")
         return (f"WRONG SHAPE: returned {got.shape}, reference is {want.shape}. "
                 f"Check the output-size formula, not the arithmetic.")
     if not np.all(np.isfinite(got)):
         n_nan = int(np.isnan(got).sum())
         n_inf = int(np.isinf(got).sum())
         where = np.argwhere(~np.isfinite(got))[0]
-        return (f"NON-FINITE OUTPUT: {n_nan} NaN and {n_inf} Inf values, first at index "
-                f"{tuple(int(i) for i in where)}. Overflow in exp, or a division by a zero "
-                f"denominator. Subtract the max before exponentiating.")
+        base = (f"NON-FINITE OUTPUT: {n_nan} NaN and {n_inf} Inf values, first at index "
+                f"{tuple(int(i) for i in where)}.")
+        if level == 4:
+            return (base + " The RMSNorm square accumulator overflowed or lost precision. "
+                    "Accumulate x*x in float64 across the entire last axis, divide by the full "
+                    "axis length, add eps, and only then normalize the row.")
+        if level == 5:
+            return (base + " Overflow in exp, or division by a zero denominator. Subtract each "
+                    "row maximum before exponentiating.")
+        if level == 8:
+            return (base + " LayerNorm variance became invalid. Use a two-pass float64 "
+                    "calculation: compute the mean first, then accumulate (x - mean)^2.")
+        return base + " Check accumulator dtype, overflow, and zero denominators."
     denom = np.maximum(np.abs(want), 1e-30)
     rel = np.abs(got - want) / denom
     i = int(np.argmax(rel))
@@ -265,8 +280,29 @@ def describe_mismatch(got, want, tol):
            f"{tuple(int(x) for x in idx)} (tolerance {tol:g}).",
            f"  expected {want.flat[i]:+.6g}, got {got.flat[i]:+.6g}",
            f"  {frac:.1%} of elements are outside tolerance"]
+    specific_diagnosis = False
+    if level == 3 and float(got.flat[i]) == 0.0 and float(want.flat[i]) < 0.0:
+        msg.append("  row maximum became 0 even though every input is negative — the max "
+                   "accumulator was likely initialized to 0; initialize it to -inf")
+        specific_diagnosis = True
+    if level == 4:
+        msg.append("  RMSNorm accumulation is inaccurate — accumulate squared values in a "
+                   "float64 scalar across the entire last axis before computing the scale")
+        specific_diagnosis = True
+    if level == 7 and input_shape and input_shape[-1] % TILE_ROWS:
+        msg.append("  matmul missed or mishandled the final contraction K tail — iterate K "
+                   "through the full dimension and use min(k0 + 128, K) for the last chunk")
+        specific_diagnosis = True
+    if level == 8:
+        msg.append("  LayerNorm variance is numerically unstable — use a two-pass float64 "
+                   "calculation, accumulating (x - mean)^2 after the mean is known")
+        specific_diagnosis = True
+    if level == 9:
+        msg.append("  the attention window is inclusive at both ends: position i must attend "
+                   "through min(n - 1, i + w), including that right-edge position")
+        specific_diagnosis = True
     # Localise it, because "somewhere" is useless feedback.
-    if got.ndim >= 2:
+    if got.ndim >= 2 and not specific_diagnosis:
         r, c = int(idx[0]), int(idx[-1])
         in_partial_row = r >= (got.shape[0] // TILE_ROWS) * TILE_ROWS
         in_partial_col = c >= (got.shape[-1] // TILE_COLS) * TILE_COLS
@@ -282,6 +318,20 @@ def describe_mismatch(got, want, tol):
         else:
             msg.append(f"  row {r} of {got.shape[0]}, column {c} of {got.shape[-1]}, "
                        "inside a full tile")
+    elif input_shape and len(input_shape) >= 2 and not specific_diagnosis:
+        row = int(idx[0]) if idx else 0
+        partial_row = input_shape[0] % TILE_ROWS != 0
+        partial_col = input_shape[-1] % TILE_COLS != 0
+        if partial_row or partial_col:
+            which = " and ".join(
+                label for label, present in (
+                    ("a final partial row tile", partial_row),
+                    ("a final partial column tile", partial_col),
+                ) if present
+            )
+            msg.append(f"  output row {row} came from an input containing {which} "
+                       f"(input shape {tuple(input_shape)}); verify that the reduction includes "
+                       "those remaining elements")
     return "\n".join(msg)
 
 
@@ -303,7 +353,7 @@ def verify(kernel_fn, n, tol=1e-4, stop_early=True):
             if stop_early:
                 break
             continue
-        m = describe_mismatch(got, want, tol)
+        m = describe_mismatch(got, want, tol, level=n, input_shape=np.shape(args[0]))
         if m:
             shp = tuple(np.shape(args[0]))
             failures.append((f"{label} input{shp}", m))
@@ -358,6 +408,202 @@ def kernel(x, a, b):
     return np.einsum('ij,->ij', a * x + b, 1.0).clip(0)
 """
 
+# Level 2 bug: processes only complete 512-column tiles and silently drops the tail.
+_BAD_2_RAGGED_COLUMN = """
+import numpy as np
+def kernel(x):
+    rows, cols = x.shape
+    out = np.zeros(rows, dtype=x.dtype)
+    for r0 in range(0, rows, 128):
+        for r in range(r0, min(r0 + 128, rows)):
+            acc = 0.0
+            for c0 in range(0, cols - (cols % 512), 512):
+                for c in range(c0, c0 + 512):
+                    acc += float(x[r, c])
+            out[r] = acc
+    return out
+"""
+
+# Level 3 bug: zero is not the identity for max when every value in a row is negative.
+_BAD_3_ZERO_IDENTITY = """
+import numpy as np
+def kernel(x):
+    rows, cols = x.shape
+    out = np.empty(rows, dtype=x.dtype)
+    for r0 in range(0, rows, 128):
+        for r in range(r0, min(r0 + 128, rows)):
+            best = 0.0
+            for c0 in range(0, cols, 512):
+                for c in range(c0, min(c0 + 512, cols)):
+                    if x[r, c] > best:
+                        best = x[r, c]
+            out[r] = best
+    return out
+"""
+
+# Level 4 bug: float16 accumulation overflows on hostile values before normalization.
+_BAD_4_LOW_PRECISION_ACCUMULATOR = """
+import numpy as np
+def kernel(x, eps=1e-6):
+    rows, cols = x.shape
+    out = np.empty_like(x)
+    for r0 in range(0, rows, 128):
+        for r in range(r0, min(r0 + 128, rows)):
+            square_sum = np.float16(0.0)
+            for c0 in range(0, cols, 512):
+                for c in range(c0, min(c0 + 512, cols)):
+                    value = np.float16(x[r, c])
+                    square_sum = np.float16(square_sum + value * value)
+            scale = np.sqrt(np.float64(square_sum) / cols + eps)
+            for c0 in range(0, cols, 512):
+                c1 = min(c0 + 512, cols)
+                out[r, c0:c1] = x[r, c0:c1] / scale
+    return out
+"""
+
+# Level 5 bug: direct exp looks fine on small values but overflows on large logits.
+_BAD_5_NAIVE_SOFTMAX = """
+import numpy as np
+def kernel(x):
+    rows, cols = x.shape
+    out = np.empty_like(x)
+    for r0 in range(0, rows, 128):
+        for r in range(r0, min(r0 + 128, rows)):
+            denominator = 0.0
+            exps = np.empty(cols, dtype=np.float64)
+            for c0 in range(0, cols, 512):
+                for c in range(c0, min(c0 + 512, cols)):
+                    exps[c] = np.exp(float(x[r, c]))
+                    denominator += exps[c]
+            for c0 in range(0, cols, 512):
+                c1 = min(c0 + 512, cols)
+                out[r, c0:c1] = exps[c0:c1] / denominator
+    return out
+"""
+
+# Level 6 bug: only complete 128x512 input tiles are transposed; all tails stay zero.
+_BAD_6_FULL_TILES_ONLY = """
+import numpy as np
+def kernel(x):
+    rows, cols = x.shape
+    out = np.zeros((cols, rows), dtype=x.dtype)
+    for r0 in range(0, rows - (rows % 128), 128):
+        for c0 in range(0, cols - (cols % 512), 512):
+            for r in range(r0, r0 + 128):
+                for c in range(c0, c0 + 512):
+                    out[c, r] = x[r, c]
+    return out
+"""
+
+# Level 7 bug: the final K chunk is dropped whenever K is not divisible by 128.
+_BAD_7_DROPS_K_TAIL = """
+import numpy as np
+def kernel(a, b):
+    M, K = a.shape
+    _, N = b.shape
+    out = np.zeros((M, N), dtype=np.float32)
+    for m0 in range(0, M, 128):
+        for n0 in range(0, N, 512):
+            for m in range(m0, min(m0 + 128, M)):
+                for n in range(n0, min(n0 + 512, N)):
+                    acc = 0.0
+                    for k0 in range(0, K - (K % 128), 128):
+                        for k in range(k0, k0 + 128):
+                            acc += float(a[m, k]) * float(b[k, n])
+                    out[m, n] = acc
+    return out
+"""
+
+# Level 8 bug: E[x^2] - E[x]^2 in float32 catastrophically cancels at large means.
+_BAD_8_ONE_PASS_VARIANCE = """
+import numpy as np
+def kernel(x, eps=1e-5):
+    rows, cols = x.shape
+    out = np.empty_like(x)
+    for r0 in range(0, rows, 128):
+        for r in range(r0, min(r0 + 128, rows)):
+            total = np.float32(0.0)
+            square_total = np.float32(0.0)
+            for c0 in range(0, cols, 512):
+                for c in range(c0, min(c0 + 512, cols)):
+                    value = np.float32(x[r, c])
+                    total = np.float32(total + value)
+                    square_total = np.float32(square_total + value * value)
+            mean = np.float32(total / cols)
+            variance = np.float32(square_total / cols - mean * mean)
+            scale = np.sqrt(np.float64(variance) + eps)
+            for c0 in range(0, cols, 512):
+                c1 = min(c0 + 512, cols)
+                out[r, c0:c1] = (x[r, c0:c1] - mean) / scale
+    return out
+"""
+
+# Level 9 bug: [i-w, i+w] is inclusive, but this excludes the right endpoint i+w.
+_BAD_9_EXCLUSIVE_RIGHT_EDGE = """
+import numpy as np
+def kernel(q, k, v, w):
+    n, d = q.shape
+    out = np.zeros_like(q)
+    root_d = np.sqrt(float(d))
+    for i in range(n):
+        start = max(0, i - w)
+        stop = min(n, i + w)
+        if stop <= start:
+            stop = min(n, start + 1)
+        scores = np.empty(stop - start, dtype=np.float64)
+        best = -np.inf
+        for j in range(start, stop):
+            score = 0.0
+            for t in range(d):
+                score += float(q[i, t]) * float(k[j, t])
+            score /= root_d
+            scores[j - start] = score
+            if score > best:
+                best = score
+        denominator = 0.0
+        for j in range(start, stop):
+            scores[j - start] = np.exp(scores[j - start] - best)
+            denominator += scores[j - start]
+        for j in range(start, stop):
+            weight = scores[j - start] / denominator
+            for t in range(d):
+                out[i, t] += weight * float(v[j, t])
+    return out
+"""
+
+# Level 10 bug: output length uses K instead of the dilation-expanded effective kernel.
+_BAD_10_IGNORES_DILATION = """
+import numpy as np
+def kernel(x, wt, stride, dilation):
+    c_in, length = x.shape
+    c_out, _, K = wt.shape
+    wrong_length = (length - K) // stride + 1
+    out = np.zeros((c_out, wrong_length), dtype=np.float32)
+    for o in range(wrong_length):
+        for kk in range(K):
+            pos = o * stride + kk * dilation
+            if pos >= length:
+                continue
+            for co in range(c_out):
+                for ci in range(c_in):
+                    out[co, o] += float(wt[co, ci, kk]) * float(x[ci, pos])
+    return out
+"""
+
+# Public fixtures used by the Stage A agent's deterministic smoke test.
+PLANTED_BUGS = {
+    1: _BAD_1_EDGE,
+    2: _BAD_2_RAGGED_COLUMN,
+    3: _BAD_3_ZERO_IDENTITY,
+    4: _BAD_4_LOW_PRECISION_ACCUMULATOR,
+    5: _BAD_5_NAIVE_SOFTMAX,
+    6: _BAD_6_FULL_TILES_ONLY,
+    7: _BAD_7_DROPS_K_TAIL,
+    8: _BAD_8_ONE_PASS_VARIANCE,
+    9: _BAD_9_EXCLUSIVE_RIGHT_EDGE,
+    10: _BAD_10_IGNORES_DILATION,
+}
+
 
 def selftest():
     print("Proving the harness catches planted bugs. If any line says UNDETECTED, the")
@@ -384,6 +630,34 @@ def selftest():
     v = check_rules("import numpy as np\ndef kernel(x):\n    return x.sum(axis=1)\n", 2)
     print(f"  level-2 .sum() cheat            -> {'caught: ' + v[0] if v else 'UNDETECTED'}")
     rc |= 0 if v else 1
+
+    print("\nProving all ten operator-specific bugs are detected:\n")
+    expected = {
+        1: "PARTIAL",
+        2: "partial column tile",
+        3: "initialized to 0",
+        4: "float64 scalar",
+        5: "subtract each row maximum",
+        6: "partial",
+        7: "contraction K tail",
+        8: "two-pass float64",
+        9: "inclusive at both ends",
+        10: "effective_kernel",
+    }
+    for level_number, source in PLANTED_BUGS.items():
+        ns = {}
+        exec(compile(source, f"planted-level-{level_number}", "exec"), ns)
+        # Overflow is the intended Level 5 failure; keep the selftest output
+        # focused on the checker's diagnosis instead of NumPy warning noise.
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            result = verify(ns["kernel"], level_number)
+        feedback = result["failures"][0][1] if result["failures"] else ""
+        caught = (not result["ok"] and expected[level_number].lower() in feedback.lower())
+        print(f"  level {level_number} planted bug          -> "
+              f"{'caught with useful feedback' if caught else 'UNDETECTED OR VAGUE'}")
+        if not caught:
+            print(textwrap.indent(feedback or "no failure message", "      "))
+        rc |= 0 if caught else 1
     return rc
 
 
