@@ -3,13 +3,18 @@
 **An agent writes small programs that run directly on the chip, and keeps verifying its own output
 as it goes.**
 
+> **Challenge Stage A is a separate, completed CPU/NumPy track.** Start with
+> [`STAGE-A-DELIVERY.md`](STAGE-A-DELIVERY.md), `stage_a_agent.py`, and `kernelbench.py` for the
+> ten-operation challenge ladder. The `agent.py`/`nkibench.py` ladder documented below is the
+> original NKI/Trainium track; its level numbers name different operations.
+
 > ## STATUS: RUNNABLE, NOT YET SOLVED
 >
 > **Works today, verified on a trn2 node:** the ladder, the checker (`nkibench.py`), four reference
 > kernels that pass it, and the agent loop (`agent.py`) writing kernels against a live model.
 >
 > **Not there yet:** the agent has not solved a single level. Its best score is 0.30 of 1.0 — code
-> that parses, obeys the rules and runs, but computes the wrong numbers. The transcripts below show
+> that parses and obeys the static rules, but fails before any test shape completes. The transcripts below show
 > exactly where it stalls, and that is the problem you are being handed.
 >
 > **Also missing:** reference kernels for levels 5 to 7, so the optimization half of the ladder is
@@ -233,7 +238,7 @@ instead, which is what fixed the same class of problem in Project 1.
 |---|---|
 | `0.0` and rounds near 55s | the answer was truncated — check for the TRUNCATED notice |
 | `0.1` | it parses but breaks a rule; read exactly which |
-| `0.3` | rules clean and it ran, but the numbers are wrong — now you are doing real work |
+| `0.3` | parses and passes static rules, but no test shape completed; inspect the load/simulation error |
 | `1.0` | correct on every shape, and the roofline verdict prints |
 | the **same** error three rounds running | your feedback is a verdict, not an instruction. Fix the message, not the prompt. |
 | identical rewards within a round | sampling is off, so there is nothing to choose between |

@@ -25,6 +25,7 @@ import traceback
 import numpy as np
 
 TILE_ROWS, TILE_COLS = 128, 512
+DEFAULT_RTOL, DEFAULT_ATOL = 1e-4, 1e-5
 
 # Functions nobody may call: they either do the whole job or hide the tiling.
 BANNED_GLOBAL = {
@@ -105,7 +106,7 @@ def _rng(seed):
 
 
 def _cases_2d(seed, prime=True):
-    """Shapes chosen to break tiling: partial tiles, prime dims, a dim of 1."""
+    """Hostile values on shapes chosen to break tiling and numerical shortcuts."""
     r = _rng(seed)
     shapes = [(8, 16), (128, 512), (129, 513), (1, 7), (7, 1), (128, 1)]
     if prime:
@@ -114,6 +115,16 @@ def _cases_2d(seed, prime=True):
     for sh in shapes:
         out.append(("normal", r.standard_normal(sh).astype(np.float32) * 1.0))
         out.append(("large", r.standard_normal(sh).astype(np.float32) * 1e3 + 1e4))
+        out.append(("strictly negative", (-np.abs(r.standard_normal(sh)) - 0.25)
+                    .astype(np.float32)))
+        # Each row is constant, but different rows may use different constants. This catches
+        # zero-variance normalization and reduction-identity mistakes without relying on chance.
+        row_values = r.standard_normal((sh[0], 1)).astype(np.float32)
+        out.append(("constant rows", np.repeat(row_values, sh[1], axis=1)))
+        # Catastrophic cancellation is invisible on ordinary random data. At this scale float32
+        # still represents variation, but E[x^2] - E[x]^2 loses it.
+        out.append(("large mean tiny variance",
+                    (1e4 + r.standard_normal(sh) * 0.1).astype(np.float32)))
         out.append(("identical rows", np.tile(r.standard_normal((1, sh[1]))
                                              .astype(np.float32), (sh[0], 1))))
         out.append(("zeros", np.zeros(sh, np.float32)))
@@ -192,6 +203,7 @@ level(10, "1D conv with stride and dilation", "output-size off-by-one; dilation 
 
 # Per-level bans: the numpy call that would trivially do the whole job.
 BANNED_RUNG = {
+    1: {"maximum", "clip", "relu"},
     2: {"sum", "cumsum", "nansum", "add.reduce", "trace"},
     3: {"max", "amax", "nanmax", "maximum.reduce", "ptp"},
     4: {"norm", "mean", "average", "sum"},
@@ -219,7 +231,47 @@ def check_rules(src, n):
         return [f"the file does not parse: {e}"]
 
     banned = BANNED_GLOBAL | BANNED_RUNG.get(n, set())
+    loops = 0
+
+    def constant_int(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+        return None
+
+    def axis_limit(name):
+        """Infer the conventional tile axis from a loop/slice variable name."""
+        lowered = (name or "").lower()
+        if lowered.startswith(("r", "row", "m", "k")):
+            return TILE_ROWS, "row/partition"
+        if lowered.startswith(("c", "col", "n")):
+            return TILE_COLS, "column/free"
+        return None, None
+
+    def slice_width(node):
+        """Recognise literal slices and common start:start+CONSTANT tile slices."""
+        if not isinstance(node, ast.Slice) or node.lower is None or node.upper is None:
+            return None
+        low, high = constant_int(node.lower), constant_int(node.upper)
+        if low is not None and high is not None:
+            return high - low
+        if (isinstance(node.upper, ast.BinOp) and isinstance(node.upper.op, ast.Add)
+                and ast.dump(node.upper.left) == ast.dump(node.lower)):
+            return constant_int(node.upper.right)
+        return None
+
     for node in ast.walk(tree):
+        if isinstance(node, ast.For):
+            loops += 1
+            # Catch the usual illegal form: for r0 in range(0, rows, 256). This is deliberately
+            # conservative; ambiguous variable names are left to the numerical harness rather
+            # than risking rejection of a legal kernel.
+            if (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name)
+                    and node.iter.func.id == "range" and len(node.iter.args) >= 3):
+                step = constant_int(node.iter.args[2])
+                target = node.target.id if isinstance(node.target, ast.Name) else ""
+                limit, axis = axis_limit(target)
+                if step is not None and limit is not None and step > limit:
+                    bad.append(f"line {node.lineno}: {axis} tile step {step} exceeds maximum {limit}")
         if isinstance(node, ast.Call):
             f = node.func
             name = (f.attr if isinstance(f, ast.Attribute)
@@ -234,12 +286,26 @@ def check_rules(src, n):
             # boolean-mask or integer-array indexing
             if isinstance(sl, (ast.Compare, ast.List)):
                 bad.append(f"line {node.lineno}: fancy/boolean indexing is not allowed")
+            dims = list(sl.elts) if isinstance(sl, ast.Tuple) else [sl]
+            for dimension, part in enumerate(dims[:2]):
+                width = slice_width(part)
+                limit = TILE_ROWS if dimension == 0 else TILE_COLS
+                if width is not None and width > limit:
+                    bad.append(f"line {node.lineno}: tile slice on dimension {dimension} has "
+                               f"width {width}, exceeding maximum {limit}")
+        if n == 6 and isinstance(node, ast.Attribute) and node.attr == "T":
+            bad.append(f"line {node.lineno}: `.T` performs the whole transpose and is banned")
+        if n in (7, 9) and isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            bad.append(f"line {node.lineno}: the `@` operator performs a banned matrix multiply")
+    if loops == 0:
+        bad.append("kernel contains no explicit loops; process the input with explicit tile loops")
     return sorted(set(bad))
 
 
 # ---------------------------------------------------------------- verification
 
-def describe_mismatch(got, want, tol, level=None, input_shape=None):
+def describe_mismatch(got, want, rtol=DEFAULT_RTOL, atol=DEFAULT_ATOL,
+                      level=None, input_shape=None):
     """The message your agent has to learn from. Vague here means slow there."""
     got = np.asarray(got, dtype=np.float64)
     want = np.asarray(want, dtype=np.float64)
@@ -268,16 +334,19 @@ def describe_mismatch(got, want, tol, level=None, input_shape=None):
             return (base + " LayerNorm variance became invalid. Use a two-pass float64 "
                     "calculation: compute the mean first, then accumulate (x - mean)^2.")
         return base + " Check accumulator dtype, overflow, and zero denominators."
-    denom = np.maximum(np.abs(want), 1e-30)
-    rel = np.abs(got - want) / denom
-    i = int(np.argmax(rel))
+    absolute = np.abs(got - want)
+    allowed = atol + rtol * np.abs(want)
+    normalized = absolute / np.maximum(allowed, np.finfo(np.float64).tiny)
+    i = int(np.argmax(normalized))
     idx = np.unravel_index(i, got.shape)
-    worst = float(rel.flat[i])
-    if worst <= tol:
+    worst = float(normalized.flat[i])
+    if worst <= 1.0:
         return None
-    frac = float((rel > tol).mean())
-    msg = [f"NUMERICAL MISMATCH: worst relative error {worst:.3g} at index "
-           f"{tuple(int(x) for x in idx)} (tolerance {tol:g}).",
+    frac = float((normalized > 1.0).mean())
+    relative = float(absolute.flat[i] / max(abs(float(want.flat[i])), atol))
+    msg = [f"NUMERICAL MISMATCH: worst tolerance ratio {worst:.3g} at index "
+           f"{tuple(int(x) for x in idx)} (rtol={rtol:g}, atol={atol:g}; "
+           f"relative error {relative:.3g}).",
            f"  expected {want.flat[i]:+.6g}, got {got.flat[i]:+.6g}",
            f"  {frac:.1%} of elements are outside tolerance"]
     specific_diagnosis = False
@@ -335,7 +404,7 @@ def describe_mismatch(got, want, tol, level=None, input_shape=None):
     return "\n".join(msg)
 
 
-def verify(kernel_fn, n, tol=1e-4, stop_early=True):
+def verify(kernel_fn, n, rtol=DEFAULT_RTOL, stop_early=True, atol=DEFAULT_ATOL):
     spec = LEVELS[n]
     cases = spec["build"]()
     failures, passed = [], 0
@@ -353,7 +422,8 @@ def verify(kernel_fn, n, tol=1e-4, stop_early=True):
             if stop_early:
                 break
             continue
-        m = describe_mismatch(got, want, tol, level=n, input_shape=np.shape(args[0]))
+        m = describe_mismatch(got, want, rtol, atol, level=n,
+                              input_shape=np.shape(args[0]))
         if m:
             shp = tuple(np.shape(args[0]))
             failures.append((f"{label} input{shp}", m))
@@ -624,11 +694,13 @@ def selftest():
         print(textwrap.indent(r["failures"][0][1], "      "))
 
     v = check_rules(_BAD_1_CHEAT, 1)
-    print(f"\n  banned einsum                  -> {'caught: ' + v[0] if v else 'UNDETECTED'}")
+    detail = next((item for item in v if "einsum" in item), v[0] if v else "")
+    print(f"\n  banned einsum                  -> {'caught: ' + detail if v else 'UNDETECTED'}")
     rc |= 0 if v else 1
 
     v = check_rules("import numpy as np\ndef kernel(x):\n    return x.sum(axis=1)\n", 2)
-    print(f"  level-2 .sum() cheat            -> {'caught: ' + v[0] if v else 'UNDETECTED'}")
+    detail = next((item for item in v if "sum" in item), v[0] if v else "")
+    print(f"  level-2 .sum() cheat            -> {'caught: ' + detail if v else 'UNDETECTED'}")
     rc |= 0 if v else 1
 
     print("\nProving all ten operator-specific bugs are detected:\n")
@@ -669,7 +741,10 @@ def main():
     ap.add_argument("--level", type=int)
     ap.add_argument("--show", action="store_true", help="print the reference for this level")
     ap.add_argument("--check", metavar="FILE.py", help="verify a candidate kernel")
-    ap.add_argument("--tol", type=float, default=1e-4)
+    ap.add_argument("--tol", "--rtol", dest="rtol", type=float, default=DEFAULT_RTOL,
+                    help="relative tolerance (default: 1e-4)")
+    ap.add_argument("--atol", type=float, default=DEFAULT_ATOL,
+                    help="absolute tolerance for values near zero (default: 1e-5)")
     ap.add_argument("--all-failures", action="store_true",
                     help="do not stop at the first failing case")
     ap.add_argument("--selftest", action="store_true")
@@ -699,7 +774,8 @@ def main():
         print(f"banned for this level: {sorted(BANNED_RUNG.get(n, set())) or 'nothing extra'}")
         print(f"always banned: {sorted(BANNED_GLOBAL)}")
         print(f"\n{len(s['build']())} test cases, including partial tiles, prime dimensions, "
-              f"a dimension of 1, large magnitudes, and identical rows.")
+              f"a dimension of 1, zeros, strict negatives, constant rows, large magnitudes, "
+              f"and large means with tiny variance.")
         return
 
     if not a.check:
@@ -721,7 +797,7 @@ def main():
     if "kernel" not in ns:
         sys.exit(f"{a.check} defines no `kernel` function")
 
-    sys.exit(report(verify(ns["kernel"], n, a.tol, not a.all_failures), n))
+    sys.exit(report(verify(ns["kernel"], n, a.rtol, not a.all_failures, a.atol), n))
 
 
 if __name__ == "__main__":

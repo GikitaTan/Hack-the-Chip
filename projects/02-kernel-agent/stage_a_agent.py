@@ -71,6 +71,15 @@ def repair_prompt(level, source, instruction, ledger):
     )
 
 
+def compact_regeneration_prompt(level, instruction):
+    """Start fresh when carrying the previous kernel would exceed the context window."""
+    return (
+        first_prompt(level)
+        + "\n\nA previous candidate failed. Incorporate this one correction in the new "
+          f"implementation: {instruction}"
+    )
+
+
 def token_breakdown(level, prompt, source="", instruction="", ledger=None):
     """Estimate where input tokens went; exact totals still come from endpoint usage."""
     ledger = ledger or []
@@ -258,8 +267,13 @@ def ask_model(args, prompt):
     import httpx
 
     estimated_prompt_tokens = max(1, len(prompt) // 4)
-    answer_budget = min(args.max_tokens,
-                        max(256, args.context - estimated_prompt_tokens - 64))
+    available = args.context - estimated_prompt_tokens - 64
+    if available < 256:
+        raise RuntimeError(
+            f"prompt needs about {estimated_prompt_tokens} tokens, leaving only {available} "
+            f"inside the {args.context}-token context window"
+        )
+    answer_budget = min(args.max_tokens, available)
     body = {
         "model": args.model,
         "messages": [{"role": "user", "content": prompt}],
@@ -267,8 +281,10 @@ def ask_model(args, prompt):
         "temperature": args.temperature,
         "top_p": 0.95,
     }
-    if args.no_think:
-        body["chat_template_kwargs"] = {"enable_thinking": False}
+    # Thinking is off by default: both workshop endpoints were observed spending the entire
+    # budget in hidden reasoning and returning no kernel. Keep --think only for controlled
+    # comparisons, and record reasoning_chars so the failure remains visible.
+    body["chat_template_kwargs"] = {"enable_thinking": args.thinking}
 
     response = httpx.post(endpoint_url(args.base, args.path), json=body,
                           timeout=args.request_timeout, verify=not args.insecure)
@@ -499,6 +515,12 @@ def solve_level(args, level, log_handle, run_number):
     best_source = ""
     attempt_categories = []
     repeated_failures = Counter()
+    token_totals = Counter()
+
+    def outcome(ok, rounds, confidence, category, code):
+        return dict(ok=ok, rounds=rounds, confidence=confidence, category=category,
+                    code=code, attempt_categories=attempt_categories,
+                    token_usage=dict(token_totals))
 
     print(f"\n=== level {level}: {kb.LEVELS[level]['name']} ===")
     for round_number in range(args.rounds):
@@ -512,6 +534,12 @@ def solve_level(args, level, log_handle, run_number):
         confidence = confidence_from_result(result)
         instruction = "" if result["ok"] else instruction_from_verdict(result["verdict"])
         elapsed = time.perf_counter() - started
+        token_totals["prompt_tokens"] += int(reply["prompt_tokens"] or 0)
+        token_totals["completion_tokens"] += int(reply["completion_tokens"] or 0)
+        token_totals["reasoning_chars"] += int(reply["reasoning_chars"] or 0)
+        token_totals["attempts"] += 1
+        for part, count in prompt_parts.items():
+            token_totals[f"input_{part}"] += int(count)
 
         if confidence > best_confidence or (result["ok"] and not best_source):
             best_confidence, best_source = confidence, source
@@ -548,9 +576,7 @@ def solve_level(args, level, log_handle, run_number):
               f"time={elapsed:.1f}s")
         if result["ok"]:
             print("  VERIFIED")
-            return dict(ok=True, rounds=round_number + 1, confidence=1.0,
-                        category="verified", code=source,
-                        attempt_categories=attempt_categories)
+            return outcome(True, round_number + 1, 1.0, "verified", source)
 
         print(f"  next instruction: {instruction[:300]}")
         if reply["finish_reason"] == "length":
@@ -562,20 +588,63 @@ def solve_level(args, level, log_handle, run_number):
         if repeated_failures[failure_key] >= args.give_up_after:
             print(f"  STOPPING: the same {category} repair failed "
                   f"{repeated_failures[failure_key]} times")
-            return dict(ok=False, rounds=round_number + 1,
-                        confidence=best_confidence, category=category,
-                        code=best_source, attempt_categories=attempt_categories)
+            return outcome(False, round_number + 1, best_confidence, category, best_source)
         if not source:
             prompt = first_prompt(level)
             prompt_parts = token_breakdown(level, prompt)
         else:
             prompt = repair_prompt(level, source, instruction, ledger)
             prompt_parts = token_breakdown(level, prompt, source, instruction, ledger)
+            if len(prompt) // 4 > args.context - 320:
+                prompt = compact_regeneration_prompt(level, instruction)
+                prompt_parts = token_breakdown(level, prompt)
+                print("  context budget: dropped the previous kernel and failure ledger; "
+                      "requesting a fresh implementation with the distilled correction")
 
     print(f"  NOT VERIFIED after {args.rounds} rounds; best confidence={best_confidence:.2f}")
-    return dict(ok=False, rounds=args.rounds, confidence=best_confidence,
-                category=ledger[-1].split(":", 1)[0] if ledger else "unknown",
-                code=best_source, attempt_categories=attempt_categories)
+    category = ledger[-1].split(":", 1)[0] if ledger else "unknown"
+    return outcome(False, args.rounds, best_confidence, category, best_source)
+
+
+def build_summary(args, levels, history, categories):
+    """Build the machine-readable experiment artifact required by the challenge."""
+    token_totals = Counter()
+    level_reports = []
+    for level in levels:
+        results = history[level]
+        for result in results:
+            token_totals.update(result["token_usage"])
+        solved = sum(result["ok"] for result in results)
+        level_reports.append({
+            "level": level,
+            "operation": kb.LEVELS[level]["name"],
+            "trap": kb.LEVELS[level]["trap"],
+            "runs": len(results),
+            "verified": solved,
+            "solve_rate": solved / len(results),
+            "mean_confidence": sum(result["confidence"] for result in results) / len(results),
+            "rounds": [result["rounds"] for result in results],
+            "final_categories": [result["category"] for result in results],
+        })
+    failure_taxonomy = {key: value for key, value in sorted(categories.items())
+                        if key != "verified"}
+    return {
+        "schema_version": "1.0",
+        "mode": "offline_smoke_test" if args.offline else "model_evaluation",
+        "model": None if args.offline else args.model,
+        "context_limit": args.context,
+        "tile_limit": {"rows": kb.TILE_ROWS, "columns": kb.TILE_COLS},
+        "tolerance": {"rtol": kb.DEFAULT_RTOL, "atol": kb.DEFAULT_ATOL,
+                      "reason": "float32 kernels with float64 reference accumulation; atol protects values near zero"},
+        "all_verified": all(report["verified"] == report["runs"] for report in level_reports),
+        "levels": level_reports,
+        "failure_taxonomy": failure_taxonomy,
+        "all_attempt_categories": dict(sorted(categories.items())),
+        "token_instrumentation": dict(sorted(token_totals.items())),
+        "attempt_log": args.log,
+        "offline_disclaimer": ("Deterministic harness smoke test; not a model solve-rate result"
+                               if args.offline else None),
+    }
 
 
 def parse_levels(args):
@@ -614,10 +683,16 @@ def main():
     parser.add_argument("--give-up-after", type=int, default=3,
                         help="stop after the same failure and repair instruction recur N times")
     parser.add_argument("--log", default="stage_a_attempts.jsonl")
+    parser.add_argument("--report", default="stage_a_report.json",
+                        help="write aggregate solve rates, taxonomy, confidence, and token use")
     parser.add_argument("--offline", action="store_true",
                         help="deterministic smoke test for levels 1-10; numbers are not model results")
-    parser.add_argument("--no-think", action="store_true",
-                        help="request thinking off on servers that support the option")
+    thinking = parser.add_mutually_exclusive_group()
+    thinking.add_argument("--think", dest="thinking", action="store_true",
+                          help="enable hidden reasoning for a controlled comparison")
+    thinking.add_argument("--no-think", dest="thinking", action="store_false",
+                          help="explicitly select the default: return code without hidden thinking")
+    parser.set_defaults(thinking=False)
     parser.add_argument("--insecure", action="store_true",
                         help="disable TLS verification only for a trusted workshop endpoint")
     args = parser.parse_args()
@@ -654,6 +729,11 @@ def main():
               f"rounds={[result['rounds'] for result in results]}")
     print("failure taxonomy:", dict(categories))
     print(f"attempt log: {args.log}")
+    summary = build_summary(args, levels, history, categories)
+    with open(args.report, "w", encoding="utf-8") as report_handle:
+        json.dump(summary, report_handle, ensure_ascii=False, indent=2)
+        report_handle.write("\n")
+    print(f"summary report: {args.report}")
     if args.offline:
         print("OFFLINE SMOKE TEST ONLY: do not report these solve rates as model results.")
 
