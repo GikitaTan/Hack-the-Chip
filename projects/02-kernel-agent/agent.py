@@ -543,6 +543,7 @@ def solve(a, level, log):
     prompt = first_prompt(level, terse)
     best = (0.0, None, "")
     tried, streak, seen = [], 0, {}
+    seen_codes = set()
     latest = ("", "")
     for rnd in range(a.rounds):
         t0 = time.perf_counter()
@@ -563,8 +564,11 @@ def solve(a, level, log):
                                       code=src, feedback=feedback, strategy=strategy_name,
                                       sample_index=i)) + "\n")
         log.flush()
-        graded.sort(key=lambda g: g[0], reverse=True)
+        # Prefer unseen code when rewards tie; reward remains the primary criterion.
+        graded.sort(key=lambda g: (g[0], g[1] not in seen_codes), reverse=True)
         top = graded[0]
+        for g in graded:
+            seen_codes.add(g[1])
         if top[0] > best[0]:
             best = (top[0], top[1], top[2])
         # Repair the LATEST attempt, not the best one. Rebuilding from the best attempt with the
