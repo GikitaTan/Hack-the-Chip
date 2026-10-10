@@ -36,6 +36,7 @@ import numpy as np
 
 import nkibench
 from prompts import level_prompt_context
+from nki_docs import DEFAULT_ROOT as NKI_DOCS_ROOT, augment_prompt
 
 MODEL = os.environ.get("KERNEL_AGENT_MODEL", "Qwen/Qwen3-8B")
 SEARCH_STRATEGIES = [
@@ -632,8 +633,13 @@ def solve(a, level, log):
     latest = ("", "")
     for rnd in range(a.rounds):
         t0 = time.perf_counter()
+        request_prompt = augment_prompt(
+            prompt, level, latest[1], latest[0], root=a.nki_docs,
+            max_chars=0 if a.no_nki_docs else a.docs_chars,
+            context=a.context, answer_tokens=a.max_tokens, terse=terse,
+        )
         replies = (offline_answers(level, a.samples, rnd) if a.offline
-                   else ask_parallel(a, prompt, a.samples))
+                   else ask_parallel(a, request_prompt, a.samples))
         graded = []
         for i, reply in enumerate(replies):
             src = extract_code(reply)
@@ -657,7 +663,8 @@ def solve(a, level, log):
                 grade_cache[fingerprint] = (reward, parts, feedback)
             graded.append((reward, src, feedback, parts, not cached))
             log.write(json.dumps(dict(level=level, round=rnd, reward=reward, parts=parts,
-                                      prompt_chars=len(prompt), reply_chars=len(reply),
+                                      prompt_chars=len(request_prompt), reply_chars=len(reply),
+                                      docs_chars=len(request_prompt) - len(prompt),
                                       code=src, feedback=feedback, strategy=strategy_name,
                                       sample_index=i, cached=cached, auto_fix=auto_fix,
                                       raw_code_hash=code_fingerprint(raw_src))) + "\n")
@@ -764,6 +771,12 @@ def main():
     ap.add_argument("--think", action="store_true",
                     help="let the model reason first; costs budget, and it ran out")
     ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--nki-docs", default=os.environ.get("NKI_DOCS_DIR", str(NKI_DOCS_ROOT)),
+                    help="path to the neuron-nki-docs skill directory")
+    ap.add_argument("--docs-chars", type=int, default=1600,
+                    help="maximum documentation characters per prompt (default: 1600)")
+    ap.add_argument("--no-nki-docs", action="store_true",
+                    help="disable local documentation retrieval for baseline comparisons")
     a = ap.parse_args()
 
     if not a.offline:
