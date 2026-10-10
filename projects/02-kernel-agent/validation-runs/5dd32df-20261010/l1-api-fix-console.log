@@ -1,0 +1,29 @@
+endpoint http://localhost:8000/v1  model Qwen/Qwen3-8B
+
+=========== level 1: average pooling 2D ===========
+round 0: this round 1.00  best so far 1.00  (18.2s)
+  Correct on every shape.
+  SOLVED on round 0. Correct on every shape.
+  ---------------- the kernel ----------------
+  import nki, nki.language as nl, nki.isa as nisa
+
+  @nki.jit
+  def tensor_avgpool_kernel(x, pool_size):
+      C, H, W = x.shape
+      p = pool_size
+      out = nl.ndarray((C, H//p, W//p), dtype=x.dtype, buffer=nl.shared_hbm)
+      in_tile = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.sbuf)
+      nisa.dma_copy(dst=in_tile, src=x)
+      pool_view = in_tile.ap([[H*W, C], [p*W, H//p], [p, W//p], [W, p], [1, p]])
+      sums = nl.sum(pool_view, axis=[3, 4])
+      scaled = nl.ndarray(sums.shape, dtype=sums.dtype, buffer=nl.sbuf)
+      nisa.tensor_scalar(dst=scaled, data=sums, op0=nl.multiply, operand0=1.0/(p*p))
+      nisa.dma_copy(dst=out, src=scaled)
+      return out
+  -------------------------------------------
+
+=========== summary ===========
+  level 1  reward 1.00 after 1 round(s)  SOLVED
+  solved 1/1
+
+attempts logged to validation-runs/5dd32df-20261010/l1-api-fix-attempts.jsonl

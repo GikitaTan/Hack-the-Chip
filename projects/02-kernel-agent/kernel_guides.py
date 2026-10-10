@@ -6,12 +6,23 @@ constraints and a short private self-check.
 """
 
 GUIDES = {
-    1: """Level 1 shape plan (average pooling):
-- Input is (C,H,W), pool_size is p, and output must be (C,H//p,W//p). Each output is the sum of its non-overlapping p-by-p input window divided by p*p.
-- Use an access-pattern view whose logical shape is (C,H//p,W//p,p,p), then reduce only the final two window axes with nl.sum. Do not call a NumPy/PyTorch pooling or mean operation.
-- DMA source and destination must contain the same number of elements. Derive the SBUF tile from the exact input slice/view; never allocate an arbitrary large tile for a small window. Keep C on the partition axis and ensure it does not exceed the supplied partition limit.
-- Checker-to-constraint: DMA_SIZE_MISMATCH/TILE_SHAPE_MISMATCH => match source, tile, and destination slice element counts and shapes; PARTITION_LIMIT/OUT_OF_BOUNDS => derive dimensions from input shape and keep all indices in range; NUMERICAL_MISMATCH => verify both p-by-p axes are reduced and divide by p*p.
-Before emitting code, privately verify the output shape, the two reduction axes, normalization, and every DMA shape. Return only the requested Python code block.""",
+    1: """Level 1 average pooling — use the installed NKI 0.6.0 API verified against reference_level1.py.
+- Exact APIs: nl.ndarray(shape, dtype, buffer=..., name='', address=None); tile.ap(pattern) where pattern is a list of [stride, count] pairs; nl.sum(x, axis, dtype=None, keepdims=False); nisa.tensor_scalar(dst, data, op0, operand0, ...); nisa.dma_copy(dst, src, ...).
+- Do not use nl.Layout, nl.OpCode, ndarray(layout=...), or guessed tensor_scalar keywords such as dtype=. Do not replace the operator with an invented opcode. For average scaling, use op0=nl.multiply and operand0=1.0/(p*p), with dst and data as named arguments.
+- Minimal verified pooling body for input in_tensor of shape (C,H,W), with p dividing H and W:
+  C,H,W = in_tensor.shape
+  out = nl.ndarray((C,H//p,W//p), dtype=in_tensor.dtype, buffer=nl.shared_hbm)
+  in_tile = nl.ndarray(in_tensor.shape, dtype=in_tensor.dtype, buffer=nl.sbuf)
+  nisa.dma_copy(dst=in_tile, src=in_tensor)
+  pool_view = in_tile.ap([[H*W,C], [p*W,H//p], [p,W//p], [W,p], [1,p]])
+  sums = nl.sum(pool_view, axis=[3,4])
+  scaled = nl.ndarray(sums.shape, dtype=sums.dtype, buffer=nl.sbuf)
+  nisa.tensor_scalar(dst=scaled, data=sums, op0=nl.multiply, operand0=1.0/(p*p))
+  nisa.dma_copy(dst=out, src=scaled)
+  return out
+- The access pattern presents logical shape (C,H//p,W//p,p,p); reduce only the final two pool axes. Keep the input tile in SBUF and returned output in shared HBM. Match the reference's exact argument names and buffer sequence.
+- Checker-to-constraint: If feedback reports an unknown API name or unexpected keyword => use only the verified names and arguments; DMA_SIZE_MISMATCH/TILE_SHAPE_MISMATCH => copy matching shapes; PARTITION_LIMIT/OUT_OF_BOUNDS => derive all extents from C,H,W and stay within limits; NUMERICAL_MISMATCH => reduce both pool axes and divide by p*p.
+Before emitting code, privately verify the output shape, access-pattern strides, reduction axes, normalization, and every DMA shape. Return only the requested Python code block.""",
     3: """Level 3 shape and dataflow plan (single-tile matmul):
 - lhsT has shape (K,M), rhs has shape (K,N), and result has shape (M,N). The first dimension K is the contraction/partition dimension in both inputs.
 - Keep every SBUF and PSUM tile explicitly 2-D: lhs (K,M), rhs (K,N), PSUM/output (M,N). Do not allocate a 1-D PSUM from lhsT.shape[1:].

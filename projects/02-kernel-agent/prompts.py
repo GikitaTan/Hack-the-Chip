@@ -1,7 +1,7 @@
 """Select a compact, level-relevant NKI API card for first_prompt."""
 
 API_BY_LEVEL = {
-    1: """Relevant NKI APIs: nl.ndarray, tile.ap access-pattern views, nl.sum(view, axis=[...]), nisa.tensor_scalar, nisa.dma_copy, nisa.tensor_copy. Use the supplied reference's supported signatures.""",
+    1: """Verified with installed NKI 0.6.0 and reference_level1.py: nl.ndarray(shape, dtype, buffer=..., name='', address=None), tile.ap(pattern), nl.sum(x, axis), nisa.tensor_scalar(dst, data, op0, operand0), nisa.dma_copy(dst, src); use nl.multiply for scalar normalization. nl.ndarray has no layout= argument.""",
     2: """Relevant NKI APIs: nl.ndarray, nl.affine_range, nl.ds, nisa.dma_copy, nisa.tensor_copy. Use the supplied reference's supported signatures.""",
     3: """Relevant NKI APIs: nl.ndarray, nisa.dma_copy, nisa.nc_matmul(dst=, stationary=, moving=), nisa.tensor_copy. nc_matmul reads both operands from SBUF and writes to PSUM.""",
     4: """Relevant NKI APIs: nl.ndarray, nl.affine_range, nisa.dma_copy, nisa.nc_matmul(dst=, stationary=, moving=), nisa.tensor_copy. nc_matmul reads both operands from SBUF and writes to PSUM.""",
