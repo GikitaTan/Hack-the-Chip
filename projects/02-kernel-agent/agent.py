@@ -23,6 +23,8 @@ Every attempt is appended to a JSONL file with its reward, so the log is the del
 """
 
 import argparse
+import ast
+import hashlib
 import json
 import os
 import re
@@ -471,6 +473,74 @@ def extract_code(text):
     return ""
 
 
+# ---------------------------------------------------------------- safe, targeted repair
+
+def repair_known_nki_error(source, feedback):
+    """Apply one mechanically verifiable repair; all results still go through grade().
+
+    Never alter the algorithm or replace the candidate with a reference kernel.
+    """
+    if not source.strip() or not re.search(
+        r"dst must be in \[?'psum'\]?|dst must be in \['psum'\]", feedback
+    ):
+        return source, ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source, ""
+
+    # Find the actual variable used as nc_matmul(dst=...), rather than guessing
+    # that the result is named 'psum'. Fix only its nl.ndarray allocation.
+    dst_names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if not (isinstance(node.func.value, ast.Name) and
+                node.func.value.id == "nisa" and node.func.attr == "nc_matmul"):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "dst" and isinstance(kw.value, ast.Name):
+                dst_names.add(kw.value.id)
+    if not dst_names:
+        return source, ""
+
+    changes = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id in dst_names for t in targets):
+            continue
+        call = node.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "nl" and call.func.attr == "ndarray"):
+            continue
+        existing = next((kw for kw in call.keywords if kw.arg == "buffer"), None)
+        target = ast.Attribute(value=ast.Name(id="nl", ctx=ast.Load()),
+                               attr="psum", ctx=ast.Load())
+        if existing:
+            if isinstance(existing.value, ast.Attribute) and existing.value.attr == "psum":
+                continue
+            existing.value = target
+        else:
+            call.keywords.append(ast.keyword(arg="buffer", value=target))
+        changes += 1
+    if not changes:
+        return source, ""
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n", "set nc_matmul destination allocation buffer=nl.psum"
+
+
+def code_fingerprint(source):
+    """Ignore formatting when deduplicating Python source."""
+    try:
+        normalized = ast.dump(ast.parse(source), include_attributes=False)
+    except SyntaxError:
+        normalized = source.strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
 # ---------------------------------------------------------------- the model
 
 def ask(a, prompt):
@@ -557,6 +627,8 @@ def solve(a, level, log):
     best = (0.0, None, "")
     tried, streak, seen = [], 0, {}
     seen_codes = set()
+    grade_cache = {}
+    repair_hint = ""
     latest = ("", "")
     for rnd in range(a.rounds):
         t0 = time.perf_counter()
@@ -570,15 +642,28 @@ def solve(a, level, log):
                 i % len(SEARCH_STRATEGIES)
             ]["name"]
 
-            reward, parts, feedback = grade(src, level)
-            graded.append((reward, src, feedback, parts))
+            raw_src = src
+            auto_fix = ""
+            # If the previous attempt exposed a known deterministic error, fix
+            # the new generation before running it through the checker.
+            if repair_hint and not a.offline:
+                src, auto_fix = repair_known_nki_error(src, repair_hint)
+            fingerprint = code_fingerprint(src)
+            cached = fingerprint in grade_cache
+            if cached:
+                reward, parts, feedback = grade_cache[fingerprint]
+            else:
+                reward, parts, feedback = grade(src, level)
+                grade_cache[fingerprint] = (reward, parts, feedback)
+            graded.append((reward, src, feedback, parts, not cached))
             log.write(json.dumps(dict(level=level, round=rnd, reward=reward, parts=parts,
                                       prompt_chars=len(prompt), reply_chars=len(reply),
                                       code=src, feedback=feedback, strategy=strategy_name,
-                                      sample_index=i)) + "\n")
+                                      sample_index=i, cached=cached, auto_fix=auto_fix,
+                                      raw_code_hash=code_fingerprint(raw_src))) + "\n")
         log.flush()
         # Prefer unseen code when rewards tie; reward remains the primary criterion.
-        graded.sort(key=lambda g: (g[0], g[1] not in seen_codes), reverse=True)
+        graded.sort(key=lambda g: (g[0], g[4], g[1] not in seen_codes), reverse=True)
         top = graded[0]
         for g in graded:
             seen_codes.add(g[1])
@@ -590,6 +675,7 @@ def solve(a, level, log):
         # stuck at 0.10 for four rounds while the prompt still carried the 0.50 code.
         if (top[1] or "").strip():
             latest = (top[1], top[2])
+        repair_hint = top[2]
         same = top[2] == (tried[-1] if tried else None)
         if same:
             # Collapse. Fifteen identical multi-line blocks is noise, not information.
@@ -606,7 +692,9 @@ def solve(a, level, log):
             return top[0], rnd + 1
         seen[top[2]] = seen.get(top[2], 0) + 1
         streak = streak + 1 if same else 1
-        if seen[top[2]] >= a.give_up_after:
+        # Only give up when the same error persists AND the model is not
+        # producing any untested candidate. Different code can share an error.
+        if seen[top[2]] >= a.give_up_after and all(not g[4] for g in graded):
             how = ("the identical failure %d rounds running" % streak if streak >= a.give_up_after
                    else "this failure for the %dth time, alternating with %d other(s)"
                         % (seen[top[2]], len(seen) - 1))
@@ -617,6 +705,13 @@ def solve(a, level, log):
             return best[0], rnd + 1
         tried.append(top[2])
         repeats = streak
+        if all(not g[4] for g in graded) and not a.offline:
+            prompt = (first_prompt(level, min(terse + 1, 2)) +
+                      "\nPrevious candidates were identical to tested failures. "
+                      "Produce a structurally different implementation.\n" +
+                      "Latest blocking error: " + latest[1])
+            print("  all candidates duplicates; switching to a fresh prompt")
+            continue
         if repeats >= 2 and (best[1] or "").strip():
             # Sampling on this endpoint is greedy, so an unchanged prompt returns an unchanged
             # answer. Measured: the same TypeError 19 rounds running. Changing the prompt is the
