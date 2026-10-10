@@ -35,7 +35,40 @@ import numpy as np
 import nkibench
 
 MODEL = os.environ.get("KERNEL_AGENT_MODEL", "Qwen/Qwen3-8B")
-
+SEARCH_STRATEGIES = [
+    {
+        "name": "simple",
+        "instruction": (
+            "Prioritize correctness and simplicity. "
+            "Use the simplest valid NKI implementation. "
+            "Avoid unnecessary operations and abstractions."
+        ),
+    },
+    {
+        "name": "tiled",
+        "instruction": (
+            "Design the kernel using explicit tiling. "
+            "Derive tile dimensions from the tensor shape "
+            "and hardware limits. Handle boundary tiles."
+        ),
+    },
+    {
+        "name": "memory",
+        "instruction": (
+            "Focus on memory layout and data movement. "
+            "Minimize unnecessary HBM transfers. "
+            "Reuse data in SBUF when possible."
+        ),
+    },
+    {
+        "name": "alternative",
+        "instruction": (
+            "Explore a different implementation structure. "
+            "Avoid copying the organization of the "
+            "previous attempt. Preserve exact correctness."
+        ),
+    },
+]
 # The model writes to a hidden reasoning channel before it writes any answer. Measured on this
 # endpoint: a coding task burned 900 tokens thinking and returned EMPTY content. See gptoss/README.
 MIN_ANSWER_TOKENS = 2500
@@ -469,11 +502,28 @@ def ask(a, prompt):
     return content
 
 
+#def ask_parallel(a, prompt, n):
+    #import concurrent.futures as cf
+    #with cf.ThreadPoolExecutor(max_workers=n) as ex:
+        #return [f.result() for f in [ex.submit(ask, a, prompt) for _ in range(n)]]
 def ask_parallel(a, prompt, n):
     import concurrent.futures as cf
-    with cf.ThreadPoolExecutor(max_workers=n) as ex:
-        return [f.result() for f in [ex.submit(ask, a, prompt) for _ in range(n)]]
 
+    def generate_one(i):
+        strategy = SEARCH_STRATEGIES[
+            i % len(SEARCH_STRATEGIES)
+        ]
+
+        new_prompt = (
+            prompt
+            + "\n\nAdditional generation strategy:\n"
+            + strategy["instruction"]
+        )
+
+        return ask(a, new_prompt)
+
+    with cf.ThreadPoolExecutor(max_workers=n) as ex:
+        return list(ex.map(generate_one, range(n)))
 
 def offline_answers(level, n, rnd):
     """No model. Replays the shipped reference, preceded by a deliberately broken version, so the
@@ -499,13 +549,19 @@ def solve(a, level, log):
         replies = (offline_answers(level, a.samples, rnd) if a.offline
                    else ask_parallel(a, prompt, a.samples))
         graded = []
-        for reply in replies:
+        for i, reply in enumerate(replies):
             src = extract_code(reply)
+
+            strategy_name = SEARCH_STRATEGIES[
+                i % len(SEARCH_STRATEGIES)
+            ]["name"]
+
             reward, parts, feedback = grade(src, level)
             graded.append((reward, src, feedback, parts))
             log.write(json.dumps(dict(level=level, round=rnd, reward=reward, parts=parts,
                                       prompt_chars=len(prompt), reply_chars=len(reply),
-                                      code=src, feedback=feedback)) + "\n")
+                                      code=src, feedback=feedback, strategy=strategy_name,
+                                      sample_index=i)) + "\n")
         log.flush()
         graded.sort(key=lambda g: g[0], reverse=True)
         top = graded[0]
