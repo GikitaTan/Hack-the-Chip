@@ -518,6 +518,9 @@ def ask_parallel(a, prompt, n):
             prompt
             + "\n\nAdditional generation strategy:\n"
             + strategy["instruction"]
+            + "\n\nPay special attention to matrix size and shape mismatches. "
+            "Check that operand dimensions, transposes, tile shapes, and output shapes "
+            "are compatible for every supported input shape, including boundary tiles."
         )
 
         return ask(a, new_prompt)
