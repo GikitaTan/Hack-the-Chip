@@ -33,6 +33,7 @@ import time
 import numpy as np
 
 import nkibench
+from prompts import level_prompt_context
 
 MODEL = os.environ.get("KERNEL_AGENT_MODEL", "Qwen/Qwen3-8B")
 SEARCH_STRATEGIES = [
@@ -389,12 +390,20 @@ def first_prompt(level, terse=0):
     """
     s = nkibench.LEVELS[level]
     import inspect
+    context = level_prompt_context(
+        level,
+        nkibench.PMAX,
+        nkibench.GEMM_STATIONARY_FMAX,
+        nkibench.GEMM_MOVING_FMAX,
+        terse=terse,
+    )
     if terse >= 2:
         # Last resort. Measured on this endpoint: one-sentence prompts answered in 300-700
         # tokens while every structured, rule-carrying prompt spiralled.
         return (f"Write a Python function `{s['entry']}` decorated with @nki.jit that computes "
                 f"the same thing as this, using nki.language as nl and nki.isa as nisa:\n\n"
                 f"{inspect.getsource(s['ref'])}\n"
+                f"{context}\n\n"
                 f"Reply with one python code block.")
     if terse >= 1:
         # The matmul memory rules are the substance of levels 3 and 4, and the short prompt has to
@@ -411,6 +420,7 @@ def first_prompt(level, terse=0):
                 f"Allocate with nl.ndarray(shape, dtype=..., buffer=nl.sbuf), move data with "
                 f"nisa.dma_copy(dst=, src=), loop with nl.affine_range(n). A tile's partition "
                 f"dimension is at most {nkibench.PMAX}.\n{mm}\n"
+                f"{context}\n\n"
                 f"Reply with one python code block.")
     return (
         f"Write an AWS Neuron NKI kernel.\n\n"
@@ -421,7 +431,7 @@ def first_prompt(level, terse=0):
         f"Hardware limits: a tile's partition dimension is at most {nkibench.PMAX}. For matmul, "
         f"the stationary free dimension is at most {nkibench.GEMM_STATIONARY_FMAX} and the "
         f"moving free dimension at most {nkibench.GEMM_MOVING_FMAX}.\n\n"
-        f"Import nki, nki.language as nl, and nki.isa as nisa.\n\n{API_CARD}\n\n"
+        f"Import nki, nki.language as nl, and nki.isa as nisa.\n\n{context}\n\n"
         f"Reply with ONE python code block containing the imports and the function. No prose.")
 
 
