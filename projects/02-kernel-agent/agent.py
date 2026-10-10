@@ -33,6 +33,7 @@ import time
 import numpy as np
 
 import nkibench
+from feedback import classify_error
 
 MODEL = os.environ.get("KERNEL_AGENT_MODEL", "Qwen/Qwen3-8B")
 
@@ -52,7 +53,7 @@ REASONING_KEYS = ("reasoning", "reasoning_content")
 WEIGHTS = dict(parses=0.1, rules=0.2, runs=0.2, correct=0.5)
 
 
-def grade(source, level):
+def _grade_text(source, level):
     """Returns (reward, parts, feedback). Feedback is an INSTRUCTION, never just a verdict."""
     parts = dict(parses=False, rules=False, runs=False, correct=False)
 
@@ -246,105 +247,43 @@ def real_signature(func_name):
 
 
 def enrich(error_text):
-    """Add the real names when the failure is an invented API call."""
-    if "'MemoryRegion' object is not callable" in error_text:
-        return (error_text + " nl.sbuf, nl.psum and nl.shared_hbm are memory regions, not "
-                "functions. Do not call them. Allocate with "
-                "nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf) and pass the region as the "
-                "buffer= argument.")
-    m = re.search(r"(\w+)\(\) got an unexpected keyword argument '(\w+)'", error_text)
-    if m:
-        sig = real_signature(m.group(1))
-        return (error_text + f" Remove the `{m.group(2)}=` argument."
-                + (f" The real signature is {sig}." if sig else ""))
-    if "unsupported operand type(s) for" in error_text and "NkiTensor" in error_text:
-        return (error_text + " A tile is not a number, so Python operators like += do not work on "
-                "one. Accumulate by allocating a PSUM tile with "
-                "nl.ndarray(shape, nl.float32, buffer=nl.psum) and letting nisa.nc_matmul add into "
-                "it across the loop, or combine two tiles with a nisa op rather than a Python "
-                "operator.")
-    m = re.search(r"dma_copy requires src and dst to have the same number of elements, "
-                  r"got src=(\d+), dst=(\d+)", error_text)
-    if m:
-        src, dst = int(m.group(1)), int(m.group(2))
-        return (error_text + f" The tile you allocated holds {dst} elements but you copied {src} "
-                f"into it. nisa.dma_copy does not slice or broadcast: allocate the destination with "
-                f"EXACTLY the shape of the slice you are moving. If you want a 128x512 piece of a "
-                f"bigger tensor, write "
-                f"t = nl.ndarray((128, 512), dtype=a.dtype, buffer=nl.sbuf) and then "
-                f"nisa.dma_copy(dst=t, src=a[0:128, 0:512]) -- the slice on the right must have the "
-                f"same shape as the tile on the left.")
-    m = re.search(r"dma_copy (\w+) partition dimension (\d+) exceeds maximum (\d+)", error_text)
-    if m:
-        which, got, mx = m.group(1), int(m.group(2)), int(m.group(3))
-        return (error_text + f" A tile may have at most {mx} rows, and you asked for {got}. Do not "
-                f"allocate one tile for the whole tensor: loop over the partition dimension in "
-                f"chunks of at most {mx} with nl.affine_range, allocate the tile inside the loop with "
-                f"the chunk's own size, and copy one chunk at a time, e.g. "
-                f"src=a[i*{mx}:(i+1)*{mx}, :]. If a dimension is already {mx} or smaller, use it "
-                f"whole -- do NOT pad it up to {mx}, that reads past the end of the tensor. The same "
-                f"applies to where you write the result back.")
-    m = re.search(r"value array of shape \((\d+),?\) could not be broadcast to "
-                  r"indexing result of shape \((\d+),?\)", error_text)
-    if m:
-        val, dst = int(m.group(1)), int(m.group(2))
-        return (error_text + f" You assigned {val} elements into a slice that holds {dst}. Assignment "
-                f"does not reshape or broadcast either: the slice on the left and the value on the "
-                f"right must have the SAME shape. If the value is bigger, you are writing a whole tile "
-                f"where a slice belongs -- index the destination to match, e.g. "
-                f"out[i*128:(i+1)*128, :] = tile. If it is smaller, you are looping over the wrong "
-                f"dimension.")
-    m = re.search(r"Out-of-bound access for tensor .*? on dimension (\d+): "
-                  r"index range \[(\d+), (\d+)\] exceed dimension size of (\d+)",
-                  error_text)
-    if m:
-        dim, hi, size = m.group(1), int(m.group(3)), int(m.group(4))
-        return (error_text + f" You indexed up to {hi} on dimension {dim}, which is only {size} "
-                f"long. Tile limits are a MAXIMUM, not a target. Derive every bound from the tensor's "
-                f"own shape -- use min(limit, size) and let the final chunk be partial -- rather than "
-                f"writing a fixed number. Note the two limits differ: the partition dimension (first) "
-                f"allows at most 128, the free dimension allows more.")
-    m = re.search(r"Matmul contraction dimension (\d+) exceeds pmax=(\d+)", error_text)
-    if m:
-        k, mx = int(m.group(1)), int(m.group(2))
-        return (error_text + f" The contraction dimension K is {k} and one nc_matmul can only "
-                f"contract {mx}. Split K into chunks of {mx} and accumulate: allocate ONE psum tile "
-                f"OUTSIDE the K loop, call nisa.nc_matmul into that same psum tile once per chunk so "
-                f"the partial products add up there, and only after the loop copy it out with "
-                f"nisa.tensor_copy. Do not allocate a new psum tile per chunk and do not write partial "
-                f"results to HBM.")
-    m = re.search(r"(\w+) (?:dst|src)? ?must be in \['sbuf', 'psum'\], got shared_hbm", error_text)
-    if m:
-        return (error_text + f" `nisa.{m.group(1)}` only moves data between on-chip buffers, sbuf and "
-                f"psum. To reach HBM -- the tensor you allocated with buffer=nl.shared_hbm and will "
-                f"return -- use nisa.dma_copy instead. The usual sequence is nc_matmul into psum, "
-                f"tensor_copy psum to sbuf, then dma_copy sbuf to the shared_hbm output.")
-    m = re.search(r"(\w+) must be in \['(\w+)'\], got (\w+)", error_text)
-    if m:
-        which, needed, got = m.groups()
-        place = {"psum": "nl.psum", "sbuf": "nl.sbuf"}.get(needed, needed)
-        return (error_text + f" Allocate the `{which}` tile with buffer={place} instead of "
-                f"nl.{got}. For nisa.nc_matmul: dst must be in nl.psum, and stationary and moving "
-                f"must both be in nl.sbuf. Copy between them with nisa.tensor_copy.")
-    if "got multiple values for argument" in error_text:
-        return (error_text + " Pass every argument by keyword, e.g. "
-                "nisa.nc_matmul(dst=..., stationary=..., moving=...), so none is bound twice.")
-    if "must have at least 2 dimensions" in error_text:
-        return (error_text + " Every SBUF and PSUM tile needs two dimensions: a partition dimension "
-                "first, then a free dimension. A 1-D tile is not allowed, so write "
-                "nl.ndarray((rows, cols), ...) and give a length-N vector the shape (1, N) or "
-                "(N, 1) depending on which axis you are reducing over.")
-    if "cannot reshape array of size" in error_text:
-        return (error_text + " Do not reshape. Work with the shapes you were given and slice "
-                "them into tiles, e.g. src=a[0:128, 0:64].")
-    m = re.search(r"module '([\w.]+)' has no attribute '(\w+)'", error_text)
-    if m:
-        return error_text + available_names(f"{m.group(1)}.{m.group(2)}")
-    m = re.search(r"'(\w+)' object has no attribute '(\w+)'", error_text)
-    if m:
-        return (error_text + f" A {m.group(1)} is not a numpy array, so it has no "
-                f"`{m.group(2)}`. Use the nl/nisa functions instead.")
-    return error_text
+    """Compatibility wrapper returning the human-readable structured diagnosis."""
+    return classify_error(error_text, stage="runtime").to_prompt()
+
+
+def _stage_from_parts(parts, feedback_text):
+    """Locate the first failed checker stage without changing its scoring logic."""
+    if not parts["parses"]:
+        return "parse"
+    if not parts["rules"]:
+        return "rules"
+    if not parts["runs"]:
+        if ("shapes passed. On " in feedback_text
+                or "CANNOT SIMULATE" in feedback_text
+                or "raised " in feedback_text):
+            return "runtime"
+        return "load"
+    if not parts["correct"]:
+        if "HBM TRAFFIC" in feedback_text:
+            return "performance"
+        return "numerics"
+    return "success"
+
+
+def grade_detailed(source, level):
+    """Return ``(reward, parts, Feedback)`` for machine consumers such as member C."""
+    reward, parts, feedback_text = _grade_text(source, level)
+    stage = _stage_from_parts(parts, feedback_text)
+    case_match = re.search(r"shapes passed\. On ([^:]+):", feedback_text)
+    feedback = classify_error(feedback_text, stage=stage, level=level,
+                              case=case_match.group(1) if case_match else None)
+    return reward, parts, feedback
+
+
+def grade(source, level):
+    """Backward-compatible checker API returning feedback as a prompt string."""
+    reward, parts, feedback = grade_detailed(source, level)
+    return reward, parts, feedback.to_prompt()
 
 def first_prompt(level, terse=0):
     """Deliberately short, and it does NOT list the rules.
@@ -501,11 +440,13 @@ def solve(a, level, log):
         graded = []
         for reply in replies:
             src = extract_code(reply)
-            reward, parts, feedback = grade(src, level)
+            reward, parts, diagnosis = grade_detailed(src, level)
+            feedback = diagnosis.to_prompt()
             graded.append((reward, src, feedback, parts))
             log.write(json.dumps(dict(level=level, round=rnd, reward=reward, parts=parts,
                                       prompt_chars=len(prompt), reply_chars=len(reply),
-                                      code=src, feedback=feedback)) + "\n")
+                                      code=src, feedback=feedback,
+                                      feedback_structured=diagnosis.to_dict())) + "\n")
         log.flush()
         graded.sort(key=lambda g: g[0], reverse=True)
         top = graded[0]
